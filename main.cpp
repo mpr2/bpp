@@ -11,6 +11,8 @@
 #include <execution>
 #include <random>
 #include <string>
+#include <filesystem>
+#include <iomanip>
 
 template <typename T>
 std::vector<size_t> argsort(const std::vector<T>& array) {
@@ -35,6 +37,10 @@ struct Vec3 {
 
     double min() const {
         return std::min(x, std::min(y, z));
+    }
+    
+    double max() const {
+        return std::max(x, std::max(y, z));
     }
 
     bool operator<(Vec3 other) const {
@@ -85,7 +91,7 @@ struct Box3D {
     }
        
     bool operator<(Box3D other) const {
-        return (min.x < other.min.x) && (min.y < other.min.y) && (min.z < other.min.z);
+        return min < other.min && max < other.max;
     }
 
     bool operator==(Box3D other) const {
@@ -96,25 +102,26 @@ struct Box3D {
 
 struct Bin {
     Vec3 dimensions = Vec3();
-    std::vector<Box3D> EMSs = std::vector<Box3D>();
+    double empty_volume = 0;
+    double max_ems_volume = 0;
+    std::set<Box3D> EMSs = std::set<Box3D>();
     std::vector<Box3D> boxes = std::vector<Box3D>();
 
     Bin(Vec3 dim) : dimensions(dim) {
-        EMSs.reserve(30);
         boxes.reserve(15);
-        EMSs.emplace_back(Vec3(), dimensions);
+        EMSs.emplace(Vec3(), dimensions);
+        empty_volume = dimensions.x * dimensions.y * dimensions.z;
+        max_ems_volume = empty_volume;
     }
 
     void update(Box3D boxToPlace, Box3D selectedEMS, double minVol, double minDim) {
         auto box = Box3D(selectedEMS.min, selectedEMS.min + boxToPlace.max);
         boxes.push_back(box);
+        empty_volume -= box.getVolume();
         auto EMSsCopy = EMSs;
         for (auto ems : EMSsCopy) {
             if (box.intersects(ems)) {
-                auto it = std::find(EMSs.begin(), EMSs.end(), ems);
-                if (it != EMSs.end()) {
-                    EMSs.erase(it);
-                }
+                EMSs.erase(ems);
 
                 Box3D newEMSs[] = {
                     Box3D(Vec3(box.max.x, ems.min.y, ems.min.z), Vec3(ems.max.x, ems.max.y, ems.max.z)),
@@ -122,42 +129,45 @@ struct Bin {
                     Box3D(Vec3(ems.min.x, ems.min.y, box.max.z), Vec3(ems.max.x, ems.max.y, ems.max.z)),
                 };
 
-                for (auto newEms : newEMSs) {
+                for (auto new_ems : newEMSs) {
                     bool isValid = true;
 
                     // Do not add new EMS having smaller dimensions of the smallest dimension of remaining boxes
-                    if (newEms.getSize().min() < minDim) {
+                    if (new_ems.getSize().min() < minDim) {
                         isValid = false;
                     }
 
                     // Do not add new EMS smaller than the volume of remaining boxes
-                    else if (newEms.getVolume() < minVol) {
+                    else if (new_ems.getVolume() < minVol) {
                         isValid = false;
                     }
 
                     // Eliminate new EMSs which are totally inscribed by other EMSs
                     else {
                         for (auto otherEms : EMSs) {
-                            if (newEms.inscribed(otherEms)) {
+                            if (new_ems.inscribed(otherEms)) {
                                 isValid = false;
                             }
                         }
                     }
 
                     if (isValid) {
-                        EMSs.push_back(newEms);
+                        EMSs.insert(new_ems);
                     }
                 }
+            }
+        }
+        max_ems_volume = 0;
+        for (auto ems : EMSs) {
+            if (ems.getVolume() > max_ems_volume) {
+                max_ems_volume = ems.getVolume();
             }
         }
     }
 
     double load() {
-        double used_volume = 0;
-        for (auto box : boxes) {
-            used_volume += box.getVolume();
-        }
-        return used_volume / (dimensions.x * dimensions.y * dimensions.z);
+        double total_volume = dimensions.x * dimensions.y * dimensions.z;
+        return (total_volume - empty_volume) / total_volume;
     }
 };
 
@@ -193,6 +203,9 @@ struct PlacementProcedure {
             size_t selected_bin_index = 0;
             Box3D selected_ems;
             for (int k = 0; k < bins.size(); k++) {
+                if (bins[k].max_ems_volume < box.getVolume()) {
+                    continue;
+                }
                 auto ems = DFTRC_2(box, bins[k]);
                 if (ems.getSize().x != 0) {
                     bin_found = true;
@@ -303,6 +316,11 @@ struct PlacementProcedure {
     }
 };
 
+struct Result {
+    double best_fitness;
+    int best_fitness_gen;
+};
+
 struct BRKGA {
     Vec3 bin_dimensions;
     const std::vector<Box3D> *boxes;
@@ -319,6 +337,7 @@ struct BRKGA {
     size_t used_bins;
     std::vector<double> solution;
     double best_fitness;
+    int best_iter;
 
     std::vector<double> mean;
     std::vector<double> min;
@@ -327,7 +346,7 @@ struct BRKGA {
         : bin_dimensions(bin_dimensions), boxes(boxes) {
             num_boxes = boxes->size();
             num_generations = 200;
-            num_individuals = 10*num_boxes;
+            num_individuals = 30*num_boxes;
             num_gene = 2*num_boxes;
             num_elites = static_cast<size_t>(std::floor(0.1*num_individuals));
             num_mutants = static_cast<size_t>(std::floor(0.15*num_individuals));
@@ -368,7 +387,7 @@ struct BRKGA {
         return fitness_list;
     }
 
-    void fit(bool verbose) {
+    Result fit(bool verbose) {
         std::srand(static_cast<unsigned int>(std::time({})));
         std::vector<std::vector<double>> population;
         population.reserve(num_individuals);
@@ -405,12 +424,12 @@ struct BRKGA {
         }
 
         auto best_fitness_it = std::min_element(fitness_list.begin(), fitness_list.end());
-        double best_fitness_gen = *(best_fitness_it);
+        best_fitness = *(best_fitness_it);
         auto best_solution = population[std::distance(fitness_list.begin(), best_fitness_it)];
-        min.push_back(best_fitness_gen);
+        min.push_back(best_fitness);
         mean.push_back(std::accumulate(fitness_list.begin(), fitness_list.end(), 0.0) / fitness_list.size());
 
-        int best_iter = 0;
+        best_iter = 0;
         for (int g = 0; g < num_generations; g++) {
             std::vector<size_t> sorted_indexes = argsort(fitness_list);
             std::vector<std::vector<double>> elites;
@@ -473,9 +492,9 @@ struct BRKGA {
             double min_fitness = 999999;
             double fitness_sum = 0;
             for (double fitness : new_fitness_list) {
-                if (fitness < best_fitness_gen) {
+                if (fitness < best_fitness) {
                     best_iter = g;
-                    best_fitness_gen = fitness;
+                    best_fitness = fitness;
                     best_solution = population[sorted_indexes[0]];
                 }
                 if (fitness < min_fitness) {
@@ -487,11 +506,13 @@ struct BRKGA {
             mean.push_back(fitness_sum / new_fitness_list.size());
 
             if (verbose) {
-                std::cout << "Generation: " << g << " \t(Best Fitness: " << best_fitness_gen << ")\n";
+                std::cout << "Generation: " << g << " \t(Best Fitness: " << best_fitness << ")\n";
             }
         }
-        used_bins = static_cast<size_t>(std::floor(best_fitness_gen));
-        best_fitness = best_fitness_gen;
+        used_bins = static_cast<size_t>(std::floor(best_fitness));
+        std::cout << "Best Fitness: " << best_fitness << std::endl;
+        std::cout << "Generation for Best Fitness: " << best_iter << std::endl;
+        return Result{best_fitness, best_iter};
     }
 };
 
@@ -500,13 +521,20 @@ double rand_uniform(double a, double b, std::mt19937& gen) {
     return dist(gen);
 }
 
-std::pair<Vec3, std::vector<Box3D>> generateInstance(int n, int instanceClass) {
+struct Instance {
+    Vec3 dimensions;
+    std::vector<Box3D> boxes;
+};
+
+Instance generateInstance(size_t n, int instanceClass) {
     std::mt19937 gen(std::random_device{}());
 
     double W, H, D;
     W = H = D = 100;
-    std::vector<Box3D> boxes;
-    boxes.reserve(n);
+    Instance instance;
+    instance.dimensions = Vec3(W, H, D);
+    instance.boxes = std::vector<Box3D>();
+    instance.boxes.reserve(n);
 
     if (instanceClass < 6) {
         W = H = D = 100.0f;
@@ -538,7 +566,7 @@ std::pair<Vec3, std::vector<Box3D>> generateInstance(int n, int instanceClass) {
 
         for (int i = 0; i < n; ++i) {
             int type = type_dist(gen);
-            boxes.push_back(Box3D(Vec3(0,0,0), Vec3(
+            instance.boxes.push_back(Box3D(Vec3(0,0,0), Vec3(
                 rand_uniform(low[type][0], high[type][0], gen),
                 rand_uniform(low[type][1], high[type][1], gen),
                 rand_uniform(low[type][2], high[type][2], gen)
@@ -548,7 +576,7 @@ std::pair<Vec3, std::vector<Box3D>> generateInstance(int n, int instanceClass) {
     else if (instanceClass == 6) {
         W = H = D = 10.0f;
         for (int i = 0; i < n; ++i)
-            boxes.push_back(Box3D(Vec3(0,0,0), Vec3(
+            instance.boxes.push_back(Box3D(Vec3(0,0,0), Vec3(
                 rand_uniform(1.0f, 10.0f, gen),
                 rand_uniform(1.0f, 10.0f, gen),
                 rand_uniform(1.0f, 10.0f, gen)
@@ -557,7 +585,7 @@ std::pair<Vec3, std::vector<Box3D>> generateInstance(int n, int instanceClass) {
     else if (instanceClass == 7) {
         W = H = D = 40.0f;
         for (int i = 0; i < n; ++i)
-            boxes.push_back(Box3D(Vec3(0,0,0), Vec3(
+            instance.boxes.push_back(Box3D(Vec3(0,0,0), Vec3(
                 rand_uniform(1.0f, 35.0f, gen),
                 rand_uniform(1.0f, 35.0f, gen),
                 rand_uniform(1.0f, 35.0f, gen)
@@ -566,52 +594,87 @@ std::pair<Vec3, std::vector<Box3D>> generateInstance(int n, int instanceClass) {
     else if (instanceClass == 8) {
         W = H = D = 100.0f;
         for (int i = 0; i < n; ++i)
-            boxes.push_back(Box3D(Vec3(0,0,0), Vec3(
+            instance.boxes.push_back(Box3D(Vec3(0,0,0), Vec3(
                 rand_uniform(1.0f, 100.0f, gen),
                 rand_uniform(1.0f, 100.0f, gen),
                 rand_uniform(1.0f, 100.0f, gen)
             )));
     }
 
-    std::pair<Vec3, std::vector<Box3D>> p;
-    p.first = Vec3(W, H, D);
-    p.second = std::move(boxes);
-
-    return p;
+    return instance;
 }
 
 int main() {
-    std::vector<Box3D> boxes;
-    boxes.reserve(200);
-/*
-    std::ifstream file("in.txt");
-    double x, y, z;
-    while (file >> x >> y >> z) {
-        boxes.push_back(Box3D(Vec3(0,0,0), Vec3(x,y,z)));
-    }
-    file.close();
-    */
+    size_t n = 50;
 
-    for (int i = 1; i < 9; i++) {
+    Instance instances[8][10];
+
+    for (int i = 0; i < 8; i++) {
+        std::string filename = "data/class-" + std::to_string(i+1) + "-" + std::to_string(n) + ".txt";
+
+        if (std::filesystem::exists(filename)) {
+            std::ifstream file(filename);
+            double W, H, D;
+            file >> W >> H >> D;
+
+            for (int k = 0; k < 10; k++) {
+                instances[i][k].dimensions = Vec3(W, H, D);
+                instances[i][k].boxes.reserve(n);
+                for (int m = 0; m < n; m++) {
+                    double x, y, z;
+                    file >> x >> y >> z;
+                    instances[i][k].boxes.emplace_back(Vec3(), Vec3(x, y, z));
+                }
+            }
+            file.close();
+        }
+        else {
+            std::ofstream file(filename);
+            file << std::fixed << std::setprecision(5);
+            for (int k = 0; k < 10; k++) {
+                instances[i][k] = generateInstance(n, i+1);
+            }
+            file << instances[i][0].dimensions.x << " " << instances[i][0].dimensions.y << " " << instances[i][0].dimensions.z << std::endl;
+            for (int k = 0; k < 10; k++) {
+                for (int m = 0; m < n; m++) {
+                    file << instances[i][k].boxes[m].max.x << " " << instances[i][k].boxes[m].max.y << " " << instances[i][k].boxes[m].max.z << std::endl;
+                }
+            }
+            file.close();
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
         std::cout << "\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n";
-        std::cout << "Class " << std::to_string(i) << std::endl;
+        std::cout << "Class " << i+1 << " (" << n << " boxes)" << std::endl;
         std::cout << "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\n";
+
+        double fitness_sum = 0;
+        int generation_sum = 0;
+        long long time_sum = 0;
+
         for (int k = 0; k < 10; k++) {
             std::cout << "\n--------------------------------\n";
             std::cout << "Run " << std::to_string(k+1) << std::endl;
             std::cout << "----------------------------------\n\n";
-            std::pair<Vec3, std::vector<Box3D>> p = generateInstance(200, i);
 
-            BRKGA ga(p.first, &p.second);
+            BRKGA ga(instances[i][k].dimensions, &instances[i][k].boxes);
 
             std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 
-            ga.fit(true);
+            Result r = ga.fit(false);
             
             std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 
-            std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+            long long time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+            std::cout << "Time difference = " << time_diff << "[ms]" << std::endl;
+            time_sum += time_diff;
+            fitness_sum += r.best_fitness;
+            generation_sum += r.best_fitness_gen;
         }
+        std::cout << "\nAverage best fitness: " << fitness_sum / 10 << std::endl;
+        std::cout << "Average generation for best fitness: " << generation_sum / 10 << std::endl;
+        std::cout << "Average runtime: " << time_sum / 10 << "[ms]" << std::endl;
     }
 
 
