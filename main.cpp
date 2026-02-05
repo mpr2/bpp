@@ -1,7 +1,6 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <set>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -104,12 +103,13 @@ struct Bin {
     Vec3 dimensions = Vec3();
     double empty_volume = 0;
     double max_ems_volume = 0;
-    std::set<Box3D> EMSs = std::set<Box3D>();
+    std::vector<Box3D> EMSs = std::vector<Box3D>();
     std::vector<Box3D> boxes = std::vector<Box3D>();
 
     Bin(Vec3 dim) : dimensions(dim) {
         boxes.reserve(15);
-        EMSs.emplace(Vec3(), dimensions);
+        EMSs.reserve(30);
+        EMSs.emplace_back(Vec3(), dimensions);
         empty_volume = dimensions.x * dimensions.y * dimensions.z;
         max_ems_volume = empty_volume;
     }
@@ -121,7 +121,10 @@ struct Bin {
         auto EMSsCopy = EMSs;
         for (auto ems : EMSsCopy) {
             if (box.intersects(ems)) {
-                EMSs.erase(ems);
+                auto it = std::find(EMSs.begin(), EMSs.end(), ems);
+                if (it != EMSs.end()) {
+                    EMSs.erase(it);
+                }
 
                 Box3D newEMSs[] = {
                     Box3D(Vec3(box.max.x, ems.min.y, ems.min.z), Vec3(ems.max.x, ems.max.y, ems.max.z)),
@@ -152,7 +155,7 @@ struct Bin {
                     }
 
                     if (isValid) {
-                        EMSs.insert(new_ems);
+                        EMSs.push_back(new_ems);
                     }
                 }
             }
