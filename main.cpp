@@ -199,7 +199,7 @@ struct PlacementProcedure {
         vbo = std::vector<double>(solution->begin() + boxes->size(), solution->end());
     }
 
-    void place() {
+    void place(bool can_rotate) {
         for (size_t i = 0; i < bps.size(); i++) {
             auto box = (*boxes)[bps[i]];
             bool bin_found = false;
@@ -209,7 +209,7 @@ struct PlacementProcedure {
                 if (bins[k].max_ems_volume < box.getVolume()) {
                     continue;
                 }
-                auto ems = DFTRC_2(box, bins[k]);
+                auto ems = DFTRC_2(box, bins[k], can_rotate);
                 if (ems.getSize().x != 0) {
                     bin_found = true;
                     selected_bin_index = k;
@@ -227,13 +227,16 @@ struct PlacementProcedure {
                 selected_ems = *(bins[selected_bin_index].EMSs.begin());
             }
 
-            auto box_orientation = selectBoxOrientation(vbo[i], box, selected_ems);
+            auto box_orientation = box.getSize();
+            if (can_rotate) {
+                box_orientation = selectBoxOrientation(vbo[i], box, selected_ems);
+            }
             auto mins = eliminationRule(i+1);
             bins[selected_bin_index].update(Box3D(Vec3(0,0,0), box_orientation), selected_ems, mins.first, mins.second);
         }
     }
 
-    Box3D DFTRC_2(Box3D box, const Bin &bin) {
+    Box3D DFTRC_2(Box3D box, const Bin &bin, bool can_rotate) {
         double max_dist = -1;
         Box3D selected_ems;
         auto dim = box.getSize();
@@ -246,7 +249,22 @@ struct PlacementProcedure {
             Vec3(dim.z, dim.y, dim.x),
         };
 
+        if (!can_rotate) {
+            for (auto ems : bin.EMSs) {
+                if (Box3D(Vec3(), dim).fits(ems)) {
+                    return ems;
+                }
+            }
+            return selected_ems;
+        }
+
         for (auto ems : bin.EMSs) {
+            if (!can_rotate) {
+                if (Box3D(Vec3(), dim).fits(ems)) {
+                    selected_ems = ems;
+                    break;
+                }
+            }
             for (int i = 0; i < 6; i++) {
                 if (Box3D(Vec3(0,0,0), orientations[i]).fits(ems)) {
                     auto distance = std::pow(bin.dimensions.x - ems.min.x - orientations[i].x, 2) +
@@ -337,8 +355,10 @@ struct BRKGA {
     size_t num_mutants;
     double eliteCProb;
 
+    bool can_rotate;
+
     size_t used_bins;
-    std::vector<double> solution;
+    //std::vector<double> solution;
     double best_fitness;
     int best_iter;
 
@@ -354,24 +374,24 @@ struct BRKGA {
             num_elites = static_cast<size_t>(std::floor(0.1*num_individuals));
             num_mutants = static_cast<size_t>(std::floor(0.15*num_individuals));
             eliteCProb = 0.7;
+            can_rotate = true;
             mean = std::vector<double>();
             mean.reserve(num_generations);
             min = std::vector<double>();
             min.reserve(num_generations);
     }
 
-    /*
-    std::vector<double> calculate_fitness(std::vector<std::vector<double>> population) {
+/*     std::vector<double> calculate_fitness(const std::vector<std::vector<double>> *population) {
         std::vector<double> fitness_list;
-        fitness_list.reserve(population.size());
-        for (auto solution : population) {
-            auto decoder = PlacementProcedure(boxes, bin_dimensions, 200, solution);
+        fitness_list.reserve(population->size());
+        for (auto solution : *population) {
+            auto decoder = PlacementProcedure(boxes, bin_dimensions, 200, &solution);
             decoder.place();
             fitness_list.push_back(decoder.evaluate());
         }
         return fitness_list;
-    }
-        */
+    } */
+
     std::vector<double> calculate_fitness(const std::vector<std::vector<double>> *population) {
         std::vector<double> fitness_list(population->size());
 
@@ -382,7 +402,7 @@ struct BRKGA {
             fitness_list.begin(),
             [&](const std::vector<double>& solution) {
                 auto decoder = PlacementProcedure(boxes, bin_dimensions, 200, &solution);
-                decoder.place();
+                decoder.place(can_rotate);
                 return decoder.evaluate();
             }
         );
@@ -403,20 +423,6 @@ struct BRKGA {
             }
             population.push_back(gene);
         }
-
-/*         std::ifstream file("solution.txt");
-        double x, y, z;
-        for (int i = 0; i < num_individuals; i++) {
-            std::vector<double> gene;
-            gene.reserve(num_gene);
-            for (int k = 0; k < num_gene; k++) {
-                double x;
-                file >> x;
-                gene.push_back(x);
-            }
-            population.push_back(gene);
-        }
-        file.close(); */
 
         std::vector<double> fitness_list = calculate_fitness(&population);
 
@@ -535,7 +541,6 @@ Instance generateInstance(size_t n, int instanceClass) {
     double W, H, D;
     W = H = D = 100;
     Instance instance;
-    instance.dimensions = Vec3(W, H, D);
     instance.boxes = std::vector<Box3D>();
     instance.boxes.reserve(n);
 
@@ -604,6 +609,7 @@ Instance generateInstance(size_t n, int instanceClass) {
             )));
     }
 
+    instance.dimensions = Vec3(W, H, D);
     return instance;
 }
 
